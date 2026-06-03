@@ -88,8 +88,19 @@ class RemoteDashboardService : Service() {
             }
 
             override fun onWakeCommand(enabled: Boolean, wakeTimeSeconds: Int?) {
+                val wakeBroadcast = Intent(ACTION_WAKE_ACTIVITY)
+                    .setPackage(packageName)
+                    .putExtra(EXTRA_WAKE, enabled)
+                if (wakeTimeSeconds != null) {
+                    wakeBroadcast.putExtra(EXTRA_WAKE_TIME_SECONDS, wakeTimeSeconds)
+                }
+                sendBroadcast(wakeBroadcast)
+
                 if (enabled) {
                     acquireWakeLock()
+                }
+
+                if (enabled && !MainActivity.isActivityInForeground) {
                     val wakeIntent = Intent(this@RemoteDashboardService, MainActivity::class.java).apply {
                         action = ACTION_WAKE_ACTIVITY
                         putExtra(EXTRA_WAKE, true)
@@ -98,19 +109,8 @@ class RemoteDashboardService : Service() {
                         }
                         addFlags(
                             Intent.FLAG_ACTIVITY_NEW_TASK or
-                                Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                                Intent.FLAG_ACTIVITY_SINGLE_TOP,
-                        )
-                    }
-                    startActivity(wakeIntent)
-                } else {
-                    val wakeIntent = Intent(this@RemoteDashboardService, MainActivity::class.java).apply {
-                        action = ACTION_WAKE_ACTIVITY
-                        putExtra(EXTRA_WAKE, false)
-                        addFlags(
-                            Intent.FLAG_ACTIVITY_NEW_TASK or
-                                Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                                Intent.FLAG_ACTIVITY_SINGLE_TOP,
+                                Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                                Intent.FLAG_ACTIVITY_REORDER_TO_FRONT,
                         )
                     }
                     startActivity(wakeIntent)

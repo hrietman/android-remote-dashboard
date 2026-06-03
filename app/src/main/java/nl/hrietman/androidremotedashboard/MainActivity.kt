@@ -25,6 +25,8 @@ class MainActivity : AppCompatActivity(), RemoteDashboardView.TouchSink {
     companion object {
         private const val MAX_RECOVERY_ATTEMPTS = 3
         private const val RELAUNCH_DELAY_MS = 1_500L
+        @Volatile
+        var isActivityInForeground: Boolean = false
     }
 
     private lateinit var binding: ActivityMainBinding
@@ -52,6 +54,7 @@ class MainActivity : AppCompatActivity(), RemoteDashboardView.TouchSink {
     private val idleHandler = Handler(Looper.getMainLooper())
     private val idleRunnable = Runnable { enterIdleMode() }
     private var mqttReceiverRegistered = false
+    private var wakeReceiverRegistered = false
     private val mqttStatusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action != RemoteDashboardService.ACTION_MQTT_STATUS) return
@@ -66,6 +69,12 @@ class MainActivity : AppCompatActivity(), RemoteDashboardView.TouchSink {
                     config,
                 )
             }
+        }
+    }
+    private val wakeReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != RemoteDashboardService.ACTION_WAKE_ACTIVITY) return
+            handleWakeIntent(intent)
         }
     }
     private val relaunchAppRunnable = Runnable {
@@ -115,12 +124,14 @@ class MainActivity : AppCompatActivity(), RemoteDashboardView.TouchSink {
     override fun onResume() {
         super.onResume()
         isActivityVisible = true
+        isActivityInForeground = true
         relaunchScheduled = false
         relaunchInProgress = false
         refreshEnhancedDimmingPermissionStatus()
         applyKioskWindowFlags()
         updateKeepScreenOnState(keepScreenOn = true)
         registerMqttStatusReceiver()
+        registerWakeReceiver()
         startOrUpdateMqttService()
         binding.dashboardView.post {
             startSession(forceRestart = false)
@@ -131,12 +142,14 @@ class MainActivity : AppCompatActivity(), RemoteDashboardView.TouchSink {
     override fun onPause() {
         super.onPause()
         isActivityVisible = false
+        isActivityInForeground = false
         if (!relaunchInProgress) {
             restartHandler.removeCallbacks(relaunchAppRunnable)
             relaunchScheduled = false
         }
         idleHandler.removeCallbacks(idleRunnable)
         unregisterMqttStatusReceiver()
+        unregisterWakeReceiver()
         sessionClient?.stop()
         sessionClient = null
     }
@@ -712,6 +725,24 @@ class MainActivity : AppCompatActivity(), RemoteDashboardView.TouchSink {
         if (!mqttReceiverRegistered) return
         unregisterReceiver(mqttStatusReceiver)
         mqttReceiverRegistered = false
+    }
+
+    private fun registerWakeReceiver() {
+        if (wakeReceiverRegistered) return
+        val filter = IntentFilter(RemoteDashboardService.ACTION_WAKE_ACTIVITY)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(wakeReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(wakeReceiver, filter)
+        }
+        wakeReceiverRegistered = true
+    }
+
+    private fun unregisterWakeReceiver() {
+        if (!wakeReceiverRegistered) return
+        unregisterReceiver(wakeReceiver)
+        wakeReceiverRegistered = false
     }
 
     private fun startOrUpdateMqttService() {
