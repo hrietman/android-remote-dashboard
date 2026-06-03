@@ -25,6 +25,7 @@ This repository is only the Android client. You still need the server-side `Remo
 - idle mode with black overlay and configurable timeout
 - optional stronger idle dimming using Android system brightness permission
 - MQTT command listener for wake control on `remotedashboard/<baseTopic>/command`
+- WallPanel-style MQTT audio playback for HTTP/HTTPS audio URLs
 - foreground MQTT service so wake handling can continue when the activity is no longer in the foreground
 
 ## Configuration options
@@ -69,6 +70,10 @@ Currently supported payloads:
 {"wake": false}
 ```
 
+```json
+{"audio": "https://example.com/alert.mp3"}
+```
+
 ### Display / Idle
 
 - screen-off timeout in seconds
@@ -108,7 +113,7 @@ Tested only on a SONOFF NSPanel Pro. Other Android devices may work, but that is
 ## Known limitations
 
 - no RAW565 decoding yet
-- no audio-related remote commands yet
+- audio commands currently support HTTP/HTTPS URLs only
 - wake and dimming behavior are tuned for the NSPanel Pro and may need adjustment on other Android devices
 - no dedicated native home/back shortcuts yet
 - session authentication relies on the remote browser session handled by the server

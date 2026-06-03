@@ -1,5 +1,6 @@
 package nl.hrietman.androidremotedashboard
 
+import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import org.eclipse.paho.client.mqttv3.IMqttActionListener
@@ -19,6 +20,7 @@ class MqttCommandClient(
     interface Listener {
         fun onMqttStatus(message: String)
         fun onWakeCommand(enabled: Boolean, wakeTimeSeconds: Int?)
+        fun onAudioCommand(audioUrl: String)
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -142,13 +144,35 @@ class MqttCommandClient(
     private fun handleMessage(payload: String) {
         try {
             val json = JSONObject(payload)
-            if (!json.has("wake")) return
-            val wake = json.optBoolean("wake", false)
-            val wakeTime = if (json.has("wakeTime")) json.optInt("wakeTime").takeIf { it > 0 } else null
-            listener.onWakeCommand(wake, wakeTime)
+            var handled = false
+
+            if (json.has("wake")) {
+                val wake = json.optBoolean("wake", false)
+                val wakeTime = if (json.has("wakeTime")) json.optInt("wakeTime").takeIf { it > 0 } else null
+                listener.onWakeCommand(wake, wakeTime)
+                handled = true
+            }
+
+            if (json.has("audio")) {
+                val audioUrl = json.optString("audio").trim()
+                if (isSupportedAudioUrl(audioUrl)) {
+                    listener.onAudioCommand(audioUrl)
+                    handled = true
+                }
+            }
+
+            if (!handled) {
+                listener.onMqttStatus("MQTT payload ignored")
+            }
         } catch (_: Exception) {
             listener.onMqttStatus("MQTT payload ignored")
         }
+    }
+
+    private fun isSupportedAudioUrl(value: String): Boolean {
+        if (value.isBlank()) return false
+        val scheme = Uri.parse(value).scheme?.lowercase()
+        return scheme == "http" || scheme == "https"
     }
 
     private fun scheduleReconnect() {

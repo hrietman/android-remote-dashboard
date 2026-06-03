@@ -27,6 +27,7 @@ class RemoteDashboardService : Service() {
 
     private var mqttClient: MqttCommandClient? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var audioPlayer: AudioCommandPlayer? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -48,6 +49,7 @@ class RemoteDashboardService : Service() {
             PowerManager.FULL_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP or PowerManager.ON_AFTER_RELEASE
         }
         wakeLock = powerManager.newWakeLock(flags, "remotedashboard:wakeLock")
+        audioPlayer = AudioCommandPlayer(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -66,6 +68,7 @@ class RemoteDashboardService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         stopMqtt()
+        stopAudio()
         if (wakeLock?.isHeld == true) {
             wakeLock?.release()
         }
@@ -116,6 +119,10 @@ class RemoteDashboardService : Service() {
                     startActivity(wakeIntent)
                 }
             }
+
+            override fun onAudioCommand(audioUrl: String) {
+                playAudio(audioUrl)
+            }
         }).also { it.start() }
     }
 
@@ -129,6 +136,17 @@ class RemoteDashboardService : Service() {
     private fun stopMqtt() {
         mqttClient?.stop()
         mqttClient = null
+    }
+
+    private fun playAudio(audioUrl: String) {
+        try {
+            audioPlayer?.play(audioUrl)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun stopAudio() {
+        audioPlayer?.stop()
     }
 
     private fun broadcastStatus(message: String) {
