@@ -16,6 +16,7 @@ object Protocol {
         const val OPEN_URL = 4
         const val KEEPALIVE = 5
         const val CURRENT_URL = 6
+        const val REQUEST_FULL_FRAME = 7
     }
 
     object Encoding {
@@ -43,6 +44,11 @@ object Protocol {
 
     fun buildKeepalivePacket(): ByteArray = byteArrayOf(
         MsgType.KEEPALIVE.toByte(),
+        VERSION,
+    )
+
+    fun buildRequestFullFramePacket(): ByteArray = byteArrayOf(
+        MsgType.REQUEST_FULL_FRAME.toByte(),
         VERSION,
     )
 

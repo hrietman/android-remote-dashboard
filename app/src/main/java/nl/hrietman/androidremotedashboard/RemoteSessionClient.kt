@@ -2,6 +2,7 @@ package nl.hrietman.androidremotedashboard
 
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -19,11 +20,9 @@ class RemoteSessionClient(
     companion object {
         private const val KEEPALIVE_INTERVAL_MS = 15_000L
         private const val CONNECT_TIMEOUT_MS = 10_000L
-        private const val INACTIVITY_TIMEOUT_MS = 30_000L
-        private const val WATCHDOG_INTERVAL_MS = 5_000L
         private const val RECONNECT_DELAY_MS = 3_000L
         private const val FIRST_FRAME_TIMEOUT_MS = 12_000L
-        private const val OPEN_URL_RETRY_MS = 2_000L
+        private const val FULL_FRAME_REQUEST_DELAY_MS = 2_000L
     }
 
     interface Listener {
@@ -38,40 +37,24 @@ class RemoteSessionClient(
     private val mainHandler = Handler(Looper.getMainLooper())
     private val reconnectRunnable = Runnable { connect() }
     private val connectTimeoutRunnable = Runnable {
-        if (stopped) return@Runnable
-        listener.onDisconnected("Connection timeout")
-        webSocket?.cancel()
-        webSocket = null
+        reconnect("Connection timeout")
     }
     private val firstFrameTimeoutRunnable = Runnable {
-        if (stopped) return@Runnable
-        listener.onDisconnected("Connected but no frame received, reconnecting")
-        webSocket?.cancel()
-        webSocket = null
+        reconnect("Connected but no frame received, reconnecting")
     }
     private val keepaliveRunnable = object : Runnable {
         override fun run() {
+            if (stopped || webSocket == null) return
             webSocket?.send(ByteString.of(*Protocol.buildKeepalivePacket()))
             mainHandler.postDelayed(this, KEEPALIVE_INTERVAL_MS)
-        }
-    }
-    private val watchdogRunnable = object : Runnable {
-        override fun run() {
-            if (stopped) return
-            val now = System.currentTimeMillis()
-            val socket = webSocket
-            if (socket != null && lastActivityAt > 0L && now - lastActivityAt > INACTIVITY_TIMEOUT_MS) {
-                listener.onDisconnected("No data from server, reconnecting")
-                socket.cancel()
-                webSocket = null
-                return
-            }
-            mainHandler.postDelayed(this, WATCHDOG_INTERVAL_MS)
         }
     }
 
     private val httpClient = OkHttpClient.Builder()
         .retryOnConnectionFailure(true)
+        // Image updates are intentionally silent on a static dashboard. Pongs,
+        // rather than incoming image traffic, establish transport liveness.
+        .pingInterval(KEEPALIVE_INTERVAL_MS, TimeUnit.MILLISECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .build()
 
@@ -79,9 +62,10 @@ class RemoteSessionClient(
     private var frameCount = 0
     private var firstFrameAt = 0L
     private var lastFrameAt = 0L
-    private var lastActivityAt = 0L
     private var stopped = false
     private var awaitingFirstFrame = false
+    private var generation = 0L
+    private var currentUrl = appConfig.normalizedInitialUrl()
     private val frameAssembler = FrameAssembler()
 
     fun start() {
@@ -92,10 +76,10 @@ class RemoteSessionClient(
 
     fun stop() {
         stopped = true
+        generation += 1
         mainHandler.removeCallbacksAndMessages(null)
-        webSocket?.close(1000, "closing")
+        webSocket?.cancel()
         webSocket = null
-        lastActivityAt = 0L
         awaitingFirstFrame = false
         frameAssembler.reset()
     }
@@ -104,75 +88,92 @@ class RemoteSessionClient(
         webSocket?.send(ByteString.of(*Protocol.buildTouchPacket(kind, x, y)))
     }
 
+    fun openUrl(url: String) {
+        currentUrl = url
+        webSocket?.send(ByteString.of(*Protocol.buildOpenUrlPacket(url)))
+    }
+
+    private fun reconnect(message: String) {
+        if (stopped) return
+        // Invalidate before cancel: late callbacks from the old socket must not
+        // tear down a replacement or schedule a second reconnect.
+        generation += 1
+        mainHandler.removeCallbacksAndMessages(null)
+        webSocket?.cancel()
+        webSocket = null
+        awaitingFirstFrame = false
+        frameAssembler.reset()
+        Log.i("RemoteSession", message)
+        listener.onDisconnected(message)
+        if (!stopped) mainHandler.postDelayed(reconnectRunnable, RECONNECT_DELAY_MS)
+    }
+
     private fun connect() {
         if (stopped) return
+        val connectionGeneration = ++generation
+        mainHandler.removeCallbacksAndMessages(null)
         listener.onConnecting("Connecting to ${appConfig.websocketUrl}")
         frameAssembler.reset()
-        lastActivityAt = System.currentTimeMillis()
         awaitingFirstFrame = true
-        mainHandler.removeCallbacks(connectTimeoutRunnable)
-        mainHandler.removeCallbacks(firstFrameTimeoutRunnable)
         mainHandler.postDelayed(connectTimeoutRunnable, CONNECT_TIMEOUT_MS)
-        mainHandler.removeCallbacks(watchdogRunnable)
-        mainHandler.postDelayed(watchdogRunnable, WATCHDOG_INTERVAL_MS)
         val request = Request.Builder()
             .url(appConfig.buildConnectionUri(width, height))
             .build()
         webSocket = httpClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                if (stopped) {
-                    webSocket.close(1000, "stopped")
-                    return
-                }
-                mainHandler.removeCallbacks(connectTimeoutRunnable)
-                listener.onConnected()
-                this@RemoteSessionClient.webSocket = webSocket
-                frameCount = 0
-                firstFrameAt = 0L
-                lastFrameAt = 0L
-                lastActivityAt = System.currentTimeMillis()
-                frameAssembler.reset()
-                val openUrlPacket = ByteString.of(*Protocol.buildOpenUrlPacket(appConfig.normalizedInitialUrl()))
-                webSocket.send(openUrlPacket)
-                mainHandler.postDelayed({
-                    if (!stopped && awaitingFirstFrame) {
-                        this@RemoteSessionClient.webSocket?.send(openUrlPacket)
+                mainHandler.post {
+                    if (stopped || connectionGeneration != generation) {
+                        webSocket.cancel()
+                        return@post
                     }
-                }, OPEN_URL_RETRY_MS)
-                mainHandler.postDelayed(firstFrameTimeoutRunnable, FIRST_FRAME_TIMEOUT_MS)
-                mainHandler.postDelayed(keepaliveRunnable, KEEPALIVE_INTERVAL_MS)
+                    mainHandler.removeCallbacks(connectTimeoutRunnable)
+                    this@RemoteSessionClient.webSocket = webSocket
+                    Log.i("RemoteSession", "Connected")
+                    listener.onConnected()
+                    frameCount = 0
+                    firstFrameAt = 0L
+                    lastFrameAt = 0L
+                    frameAssembler.reset()
+                    val openUrlPacket = ByteString.of(*Protocol.buildOpenUrlPacket(currentUrl))
+                    webSocket.send(openUrlPacket)
+                    mainHandler.postDelayed({
+                        if (!stopped && connectionGeneration == generation && awaitingFirstFrame) {
+                            // Reconnecting to an unchanged page may not produce a
+                            // diff; ask for its image without navigating again.
+                            webSocket.send(ByteString.of(*Protocol.buildRequestFullFramePacket()))
+                        }
+                    }, FULL_FRAME_REQUEST_DELAY_MS)
+                    mainHandler.postDelayed(firstFrameTimeoutRunnable, FIRST_FRAME_TIMEOUT_MS)
+                    mainHandler.postDelayed(keepaliveRunnable, KEEPALIVE_INTERVAL_MS)
+                }
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                lastActivityAt = System.currentTimeMillis()
-                handleBinaryMessage(bytes.toByteArray())
+                mainHandler.post {
+                    if (!stopped && connectionGeneration == generation) {
+                        handleBinaryMessage(bytes.toByteArray())
+                    }
+                }
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                mainHandler.removeCallbacks(connectTimeoutRunnable)
-                mainHandler.removeCallbacks(firstFrameTimeoutRunnable)
-                this@RemoteSessionClient.webSocket = null
-                awaitingFirstFrame = false
-                frameAssembler.reset()
-                listener.onDisconnected("Closing: $code $reason")
+                mainHandler.post {
+                    if (!stopped && connectionGeneration == generation) reconnect("Closing: $code $reason")
+                }
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                mainHandler.removeCallbacks(connectTimeoutRunnable)
-                mainHandler.removeCallbacks(firstFrameTimeoutRunnable)
-                this@RemoteSessionClient.webSocket = null
-                awaitingFirstFrame = false
-                frameAssembler.reset()
-                listener.onDisconnected("Closed: $code $reason")
+                mainHandler.post {
+                    if (!stopped && connectionGeneration == generation) reconnect("Closed: $code $reason")
+                }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                mainHandler.removeCallbacks(connectTimeoutRunnable)
-                mainHandler.removeCallbacks(firstFrameTimeoutRunnable)
-                this@RemoteSessionClient.webSocket = null
-                awaitingFirstFrame = false
-                frameAssembler.reset()
-                listener.onDisconnected("Error: ${t.message ?: "WebSocket failure"}")
+                mainHandler.post {
+                    if (!stopped && connectionGeneration == generation) {
+                        reconnect("Error: ${t.message ?: "WebSocket failure"}")
+                    }
+                }
             }
         })
     }
@@ -201,7 +202,10 @@ class RemoteSessionClient(
                 )
             }
             Protocol.MsgType.CURRENT_URL -> {
-                FrameParser.parseCurrentUrl(payload)?.let(listener::onCurrentUrl)
+                FrameParser.parseCurrentUrl(payload)?.let { url ->
+                    currentUrl = url
+                    listener.onCurrentUrl(url)
+                }
             }
             Protocol.MsgType.FRAME_STATS -> {
                 val renderMs = FrameParser.parseFrameStats(payload) ?: return

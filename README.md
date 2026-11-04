@@ -117,3 +117,16 @@ Tested only on a SONOFF NSPanel Pro. Other Android devices may work, but that is
 - wake and dimming behavior are tuned for the NSPanel Pro and may need adjustment on other Android devices
 - no dedicated native home/back shortcuts yet
 - session authentication relies on the remote browser session handled by the server
+
+## Connection recovery and idle behavior (0.2.1)
+
+- WebSocket ping/pong checks connection health; an unchanged dashboard is allowed to send no image data.
+- Real connection failures retry in place, keeping the last image, current dashboard URL and idle timer. Recovery no longer opens the Android launcher or restarts the activity.
+- A new connection requests a full frame if the server has no page changes to send.
+- At the configured screen-off timeout the panel dims and returns to its configured initial URL behind the idle overlay. Dashboard-specific return timers (such as a 60-second subview return) still run independently.
+
+Run the connection regression tests with JDK 17:
+
+```bash
+JAVA_HOME=$(/usr/libexec/java_home -v 17) ./gradlew testDebugUnitTest assembleDebug
+```

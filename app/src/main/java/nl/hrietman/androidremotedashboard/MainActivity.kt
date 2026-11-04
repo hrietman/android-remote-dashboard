@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.WindowInsets
@@ -23,8 +24,6 @@ import java.util.Locale
 
 class MainActivity : AppCompatActivity(), RemoteDashboardView.TouchSink {
     companion object {
-        private const val MAX_RECOVERY_ATTEMPTS = 3
-        private const val RELAUNCH_DELAY_MS = 1_500L
         @Volatile
         var isActivityInForeground: Boolean = false
     }
@@ -37,20 +36,16 @@ class MainActivity : AppCompatActivity(), RemoteDashboardView.TouchSink {
     private var latestFps: Double = 0.0
     private var latestMqttStatus: String = "MQTT disabled"
     private var isActivityVisible = false
-    private var relaunchScheduled = false
-    private var relaunchInProgress = false
-    private var recoveryAttempt = 0
+    private var currentDashboardUrl: String? = null
     private var isPopulatingSettings = false
     private var runtimeConfigDirty = false
     private var mqttConfigDirty = false
     private var hasRenderedFrame = false
     private var idleActive = false
     private var forcedWakeUntilMs = 0L
-    private var suppressDisconnectRecoveryUntilMs = 0L
     private var systemBrightnessBeforeIdle: Int? = null
     private var systemBrightnessModeBeforeIdle: Int? = null
     private var latestEnhancedDimmingPermissionGranted = false
-    private val restartHandler = Handler(Looper.getMainLooper())
     private val idleHandler = Handler(Looper.getMainLooper())
     private val idleRunnable = Runnable { enterIdleMode() }
     private var mqttReceiverRegistered = false
@@ -77,23 +72,9 @@ class MainActivity : AppCompatActivity(), RemoteDashboardView.TouchSink {
             handleWakeIntent(intent)
         }
     }
-    private val relaunchAppRunnable = Runnable {
-        relaunchScheduled = false
-        relaunchInProgress = false
-        if (!isFinishing && !isDestroyed) {
-            val launchIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-            }
-            if (launchIntent != null) {
-                startActivity(launchIntent)
-            } else {
-                recreate()
-            }
-        }
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Log.i("RemoteDashboard", "Activity created")
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         applyKioskWindowFlags()
@@ -125,11 +106,9 @@ class MainActivity : AppCompatActivity(), RemoteDashboardView.TouchSink {
         super.onResume()
         isActivityVisible = true
         isActivityInForeground = true
-        relaunchScheduled = false
-        relaunchInProgress = false
         refreshEnhancedDimmingPermissionStatus()
         applyKioskWindowFlags()
-        updateKeepScreenOnState(keepScreenOn = true)
+        updateKeepScreenOnState(keepScreenOn = !idleActive)
         registerMqttStatusReceiver()
         registerWakeReceiver()
         startOrUpdateMqttService()
@@ -143,10 +122,6 @@ class MainActivity : AppCompatActivity(), RemoteDashboardView.TouchSink {
         super.onPause()
         isActivityVisible = false
         isActivityInForeground = false
-        if (!relaunchInProgress) {
-            restartHandler.removeCallbacks(relaunchAppRunnable)
-            relaunchScheduled = false
-        }
         idleHandler.removeCallbacks(idleRunnable)
         unregisterMqttStatusReceiver()
         unregisterWakeReceiver()
@@ -177,62 +152,35 @@ class MainActivity : AppCompatActivity(), RemoteDashboardView.TouchSink {
         val config = currentConfig ?: AppConfig.load(this)
         if (viewWidth <= 0 || viewHeight <= 0) return
 
-        if (forceRestart || sessionClient == null) {
+        if (forceRestart) currentDashboardUrl = null
+        if (forceRestart || !hasRenderedFrame) {
             hasRenderedFrame = false
             showStartupOverlay("Connecting", config.normalizedInitialUrl(), config)
         }
         binding.dashboardView.configure(viewWidth, viewHeight)
         if (!forceRestart && sessionClient != null) return
 
-        if (forceRestart && sessionClient != null) {
-            suppressDisconnectRecoveryUntilMs = System.currentTimeMillis() + 3_000L
-        }
         sessionClient?.stop()
-        sessionClient = RemoteSessionClient(config, viewWidth, viewHeight, object : RemoteSessionClient.Listener {
+        val sessionConfig = config.copy(initialUrl = currentDashboardUrl ?: config.initialUrl)
+        sessionClient = RemoteSessionClient(sessionConfig, viewWidth, viewHeight, object : RemoteSessionClient.Listener {
             override fun onConnecting(message: String) {
                 runOnUiThread {
                     binding.statusText.text = message
-                    showStartupOverlay(message, config.normalizedInitialUrl(), config)
+                    if (!hasRenderedFrame) showStartupOverlay(message, config.normalizedInitialUrl(), config)
                 }
             }
 
             override fun onConnected() {
                 runOnUiThread {
-                    restartHandler.removeCallbacks(relaunchAppRunnable)
-                    relaunchScheduled = false
-                    relaunchInProgress = false
-                    recoveryAttempt = 0
                     binding.statusText.text = "Connected"
-                    showStartupOverlay("Connected", config.normalizedInitialUrl(), config)
+                    if (!hasRenderedFrame) showStartupOverlay("Connected", config.normalizedInitialUrl(), config)
                 }
             }
 
             override fun onDisconnected(message: String) {
                 runOnUiThread {
-                    if (System.currentTimeMillis() < suppressDisconnectRecoveryUntilMs) {
-                        binding.statusText.text = message
-                        return@runOnUiThread
-                    }
-                    val status = recoveryStatus(message)
-                    binding.statusText.text = status
-                    hasRenderedFrame = false
-                    showStartupOverlay(status, config.normalizedInitialUrl(), config)
-                    if (isActivityVisible) {
-                        sessionClient?.stop()
-                        sessionClient = null
-                        if (!relaunchScheduled && recoveryAttempt < MAX_RECOVERY_ATTEMPTS) {
-                            recoveryAttempt += 1
-                            relaunchScheduled = true
-                            relaunchInProgress = true
-                            val homeIntent = Intent(Intent.ACTION_MAIN).apply {
-                                addCategory(Intent.CATEGORY_HOME)
-                                flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                            }
-                            startActivity(homeIntent)
-                            restartHandler.removeCallbacks(relaunchAppRunnable)
-                            restartHandler.postDelayed(relaunchAppRunnable, RELAUNCH_DELAY_MS)
-                        }
-                    }
+                    binding.statusText.text = message
+                    if (!hasRenderedFrame) showStartupOverlay(message, config.normalizedInitialUrl(), config)
                 }
             }
 
@@ -250,6 +198,7 @@ class MainActivity : AppCompatActivity(), RemoteDashboardView.TouchSink {
 
             override fun onCurrentUrl(url: String) {
                 runOnUiThread {
+                    currentDashboardUrl = url
                     binding.urlText.text = url
                     if (!hasRenderedFrame) {
                         showStartupOverlay(
@@ -555,15 +504,25 @@ class MainActivity : AppCompatActivity(), RemoteDashboardView.TouchSink {
     }
 
     private fun enterIdleMode() {
-        if (binding.settingsOverlay.visibility == View.VISIBLE) return
+        if (idleActive || binding.settingsOverlay.visibility == View.VISIBLE) return
+        Log.i("RemoteDashboard", "Entering idle")
         idleActive = true
         binding.idleOverlay.visibility = View.VISIBLE
         applyEnhancedIdleSystemDimmingIfNeeded()
         applyUiConfig(currentConfig ?: AppConfig.DEFAULT)
         updateKeepScreenOnState(keepScreenOn = false)
+        // Reset the dashboard behind the black overlay without restarting the
+        // activity or its socket. A wake then presents this panel's home page.
+        val homeUrl = (currentConfig ?: AppConfig.DEFAULT).normalizedInitialUrl()
+        if (currentDashboardUrl != null && currentDashboardUrl != homeUrl) {
+            Log.i("RemoteDashboard", "Returning to initial dashboard while idle")
+            currentDashboardUrl = homeUrl
+            sessionClient?.openUrl(homeUrl)
+        }
     }
 
     private fun wakeFromIdle(resetForcedWake: Boolean) {
+        if (idleActive) Log.i("RemoteDashboard", "Waking from idle")
         if (resetForcedWake) {
             forcedWakeUntilMs = 0L
         }
@@ -691,14 +650,6 @@ class MainActivity : AppCompatActivity(), RemoteDashboardView.TouchSink {
         )
         persistConfig(updated, runtimeChanged = false)
         populateSettingsForm(updated)
-    }
-
-    private fun recoveryStatus(message: String): String {
-        return if (recoveryAttempt <= 0) {
-            message
-        } else {
-            "$message • Retry $recoveryAttempt/$MAX_RECOVERY_ATTEMPTS"
-        }
     }
 
     private fun updateKeepScreenOnState(keepScreenOn: Boolean) {
